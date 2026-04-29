@@ -1,0 +1,364 @@
+import tkinter as tk
+import sounddevice as sd
+import wavio
+import numpy as np
+import os
+import json
+from threading import Thread
+import pygame
+from vosk import Model, KaldiRecognizer
+import wave
+from fuzzywuzzy import fuzz
+import difflib
+
+class SmartVoiceReminder:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("دستیار یادآوری هوشمند")
+        self.root.geometry("500x600")
+        self.root.resizable(False, False)
+        self.root.configure(bg='#2c3e50')
+        
+        # تنظیمات صدا
+        self.samplerate = 16000  # Vosk نیاز به 16kHz دارد
+        self.is_recording = False
+        self.recording_data = []
+        self.temp_audio = "temp_recording.wav"
+        
+        # دیتابیس پیام‌ها
+        self.messages = []  # [{"text": "...", "file": "...", "keywords": [...]}]
+        self.current_mode = None  # "save" یا "ask"
+        
+        # راه‌اندازی pygame
+        pygame.mixer.init(frequency=44100, size=-16, channels=1)
+        
+        # بارگذاری مدل Vosk (باید پوشه model در مسیر برنامه باشد)
+        self.load_vosk_model()
+        
+        self.setup_gui()
+        
+    def load_vosk_model(self):
+        """بارگذاری مدل تشخیص گفتار فارسی"""
+        model_path = "vosk-model-small-fa-0.5"
+        if not os.path.exists(model_path):
+            # پیام راهنما برای دانلود مدل
+            self.show_model_download_help()
+            # ایجاد یک مدل ساده fake برای جلوگیری از خطا (در صورت عدم وجود)
+            self.model = None
+        else:
+            try:
+                self.model = Model(model_path)
+                print("✅ مدل Vosk بارگذاری شد")
+            except Exception as e:
+                print(f"❌ خطا در بارگذاری مدل: {e}")
+                self.model = None
+    
+    def show_model_download_help(self):
+        """نمایش راهنمای دانلود مدل"""
+        help_window = tk.Toplevel(self.root)
+        help_window.title("نیاز به دانلود مدل")
+        help_window.geometry("400x300")
+        
+        msg = """⚠️ برای کارکرد صحیح برنامه، نیاز به دانلود مدل فارسی Vosk است:
+
+1. به لینک زیر بروید:
+   https://alphacephei.com/vosk/models
+
+2. فایل vosk-model-small-fa-0.5.zip را دانلود کنید
+
+3. آن را در همین پوشه (محل برنامه) extract کنید
+
+4. برنامه را دوباره اجرا کنید
+
+💡 تا زمانی که مدل نصب نشود، برنامه فقط ضبط ساده انجام می‌دهد."""
+        
+        tk.Label(help_window, text=msg, justify='right', wraplength=380, 
+                font=('B Nazanin', 11)).pack(padx=10, pady=10)
+        tk.Button(help_window, text="متوجه شدم", command=help_window.destroy).pack(pady=10)
+    
+    def setup_gui(self):
+        """راه‌اندازی رابط کاربری"""
+        # عنوان
+        title = tk.Label(self.root, text="🧠 دستیار یادآوری هوشمند", 
+                        font=('B Nazanin', 20, 'bold'), 
+                        bg='#2c3e50', fg='white')
+        title.pack(pady=15)
+        
+        # وضعیت
+        self.status_label = tk.Label(self.root, text="آماده", 
+                                    font=('B Nazanin', 12), 
+                                    bg='#2c3e50', fg='#ecf0f1')
+        self.status_label.pack(pady=5)
+        
+        # فریم دکمه‌ها
+        btn_frame = tk.Frame(self.root, bg='#2c3e50')
+        btn_frame.pack(pady=20)
+        
+        # دکمه قرمز: ذخیره پیام
+        self.red_btn = tk.Button(btn_frame, 
+                                text="🔴 ضبط پیام\n(محل قراردادن چیزی)", 
+                                bg='#e74c3c', fg='white',
+                                font=('B Nazanin', 13, 'bold'),
+                                width=18, height=4,
+                                command=lambda: self.set_mode("save"))
+        self.red_btn.grid(row=0, column=0, padx=10)
+        
+        # دکمه آبی: پرسش
+        self.blue_btn = tk.Button(btn_frame, 
+                                 text="🔵 کجاست؟\n(جستجوی صوتی)", 
+                                 bg='#3498db', fg='white',
+                                 font=('B Nazanin', 13, 'bold'),
+                                 width=18, height=4,
+                                 command=lambda: self.set_mode("ask"))
+        self.blue_btn.grid(row=0, column=1, padx=10)
+        
+        # دکمه کنترل ضبط
+        self.record_btn = tk.Button(self.root, 
+                                   text="⏺ شروع ضبط صدا", 
+                                   bg='#95a5a6', fg='white',
+                                   font=('B Nazanin', 14, 'bold'),
+                                   width=25, height=2,
+                                   state='disabled',
+                                   command=self.toggle_recording)
+        self.record_btn.pack(pady=20)
+        
+        # نمایش متن تشخیص داده شده
+        self.text_display = tk.Text(self.root, height=4, width=50, 
+                                   font=('B Nazanin', 11), 
+                                   bg='#ecf0f1', justify='right')
+        self.text_display.pack(pady=10)
+        self.text_display.insert('1.0', "متن تشخیص داده شده اینجا نمایش داده می‌شود...")
+        self.text_display.config(state='disabled')
+        
+        # لیست پیام‌های ذخیره شده
+        tk.Label(self.root, text="📋 پیام‌های ذخیره شده:", 
+                font=('B Nazanin', 12, 'bold'), 
+                bg='#2c3e50', fg='white').pack()
+        
+        self.listbox = tk.Listbox(self.root, width=50, height=8, 
+                                 font=('B Nazanin', 11),
+                                 justify='right')
+        self.listbox.pack(pady=10)
+        
+        # راهنما
+        help_text = "💡 راهنما: ابتدا 'ضبط پیام' را بزنید، بگویید 'کتابم در کشو است'،\nسپس 'کجاست؟' را زده و بپرسید 'کتابم کجاست؟'"
+        tk.Label(self.root, text=help_text, 
+                font=('B Nazanin', 10), 
+                bg='#2c3e50', fg='#bdc3c7').pack()
+    
+    def set_mode(self, mode):
+        """تنظیم حالت کار (ذخیره یا پرسش)"""
+        self.current_mode = mode
+        if mode == "save":
+            self.record_btn.config(text="⏺ شروع ضبط پیام جدید", 
+                                  bg='#e74c3c', state='normal')
+            self.status_label.config(text="حالت: ذخیره پیام جدید", fg='#e74c3c')
+        else:
+            self.record_btn.config(text="❓ شروع ضبط سوال", 
+                                  bg='#3498db', state='normal')
+            self.status_label.config(text="حالت: پرسش کجاست؟", fg='#3498db')
+    
+    def toggle_recording(self):
+        """شروع یا پایان ضبط"""
+        if not self.is_recording:
+            self.start_recording()
+        else:
+            self.stop_recording()
+    
+    def start_recording(self):
+        """شروع ضبط صدا"""
+        self.is_recording = True
+        self.recording_data = []
+        self.record_btn.config(text="⏹ پایان ضبط", bg='#f39c12')
+        self.status_label.config(text="🔴 در حال ضبط صدا...", fg='red')
+        
+        # شروع ضبط در ترد جداگانه
+        self.record_thread = Thread(target=self.record_audio)
+        self.record_thread.start()
+    
+    def record_audio(self):
+        """ضبط صدا از میکروفون"""
+        def callback(indata, frames, time, status):
+            if self.is_recording:
+                self.recording_data.append(indata.copy())
+        
+        try:
+            with sd.InputStream(samplerate=self.samplerate, channels=1, 
+                              dtype=np.int16, callback=callback):
+                while self.is_recording:
+                    sd.sleep(100)
+        except Exception as e:
+            self.status_label.config(text=f"❌ خطای میکروفون: {str(e)}")
+    
+    def stop_recording(self):
+        """توقف ضبط و پردازش"""
+        self.is_recording = False
+        self.record_btn.config(text="⏺ شروع ضبط صدا", 
+                              state='normal', bg='#95a5a6')
+        
+        if len(self.recording_data) == 0:
+            self.status_label.config(text="⚠️ صدایی ضبط نشد")
+            return
+        
+        # ذخیره فایل موقت
+        recording = np.concatenate(self.recording_data, axis=0)
+        wavio.write(self.temp_audio, recording, self.samplerate, sampwidth=2)
+        
+        # تبدیل به متن
+        if self.model:
+            text = self.speech_to_text(self.temp_audio)
+            self.update_text_display(text)
+            
+            if self.current_mode == "save":
+                self.save_message(text)
+            else:
+                self.find_and_play(text)
+        else:
+            self.status_label.config(text="⚠️ مدل Vosk نصب نیست - فقط ضبط انجام شد")
+    
+    def speech_to_text(self, audio_file):
+        """تبدیل فایل صوتی به متن با Vosk"""
+        try:
+            wf = wave.open(audio_file, "rb")
+            rec = KaldiRecognizer(self.model, wf.getframerate())
+            rec.SetWords(True)
+            
+            results = []
+            while True:
+                data = wf.readframes(4000)
+                if len(data) == 0:
+                    break
+                if rec.AcceptWaveform(data):
+                    result = json.loads(rec.Result())
+                    if result.get('text'):
+                        results.append(result['text'])
+            
+            # دریافت نتیجه نهایی
+            final_result = json.loads(rec.FinalResult())
+            if final_result.get('text'):
+                results.append(final_result['text'])
+            
+            wf.close()
+            return " ".join(results)
+        except Exception as e:
+            return f"خطا در تشخیص: {str(e)}"
+    
+    def update_text_display(self, text):
+        """به‌روزرسانی نمایش متن"""
+        self.text_display.config(state='normal')
+        self.text_display.delete('1.0', tk.END)
+        self.text_display.insert('1.0', f"متن تشخیص داده شده:\n{text}")
+        self.text_display.config(state='disabled')
+    
+    def save_message(self, text):
+        """ذخیره پیام جدید"""
+        if not text or text.startswith("خطا"):
+            self.status_label.config(text="❌ متن نامعتبر")
+            return
+        
+        # تولید نام فایل منحصر به فرد
+        msg_id = len(self.messages) + 1
+        filename = f"message_{msg_id}.wav"
+        
+        # کپی فایل موقت به فایل اصلی
+        import shutil
+        shutil.copy(self.temp_audio, filename)
+        
+        # استخراج کلمات کلیدی (حذف کلمات رایج)
+        stop_words = ['را', 'در', 'است', 'کردم', 'گذاشتم', 'من', 'این', 'آن', 'است']
+        words = text.split()
+        keywords = [w for w in words if w not in stop_words]
+        
+        # ذخیره در دیتابیس
+        message_data = {
+            "id": msg_id,
+            "text": text,
+            "file": filename,
+            "keywords": keywords
+        }
+        self.messages.append(message_data)
+        
+        # نمایش در لیست
+        short_text = text[:40] + "..." if len(text) > 40 else text
+        self.listbox.insert(0, f"{msg_id}. {short_text}")
+        
+        self.status_label.config(text=f"✅ پیام {msg_id} ذخیره شد", fg='#2ecc71')
+    
+    def find_and_play(self, question_text):
+        """جستجوی هوشمند و پخش پاسخ"""
+        if not self.messages:
+            self.status_label.config(text="❌ هنوز پیامی ذخیره نشده است!")
+            return
+        
+        if not question_text or question_text.startswith("خطا"):
+            self.status_label.config(text="❌ سوال نامعتبر است")
+            return
+        
+        self.status_label.config(text="🔍 در حال جستجو...", fg='#f39c12')
+        
+        # استخراج کلمه کلیدی از سوال (حذف کلمات پرسشی)
+        question_words = question_text.split()
+        query_terms = [w for w in question_words if w not in ['کجاست', 'کدام', 'کجا', 'است', 'من', 'را', '?']]
+        
+        if not query_terms:
+            self.status_label.config(text="⚠️ لطفاً نام شیء را در سوال بگویید (مثلاً 'کتاب')")
+            return
+        
+        # جستجوی بهترین تطابق
+        best_match = None
+        best_score = 0
+        
+        for msg in self.messages:
+            # روش 1: بررسی وجود کلمه در متن اصلی
+            score = 0
+            for term in query_terms:
+                if term in msg['text']:
+                    score += 50
+            
+            # روش 2: fuzzy matching برای شباهت کلی
+            similarity = fuzz.partial_ratio(question_text, msg['text'])
+            score += similarity
+            
+            # روش 3: بررسی کلمات کلیدی
+            for kw in msg['keywords']:
+                for term in query_terms:
+                    if difflib.SequenceMatcher(None, term, kw).ratio() > 0.7:
+                        score += 30
+            
+            if score > best_score:
+                best_score = score
+                best_match = msg
+        
+        if best_match and best_score > 30:  # حداقل آستانه امتیاز
+            self.play_message(best_match, best_score)
+        else:
+            self.status_label.config(text="❌ موردی یافت نشد. دوباره امتحان کنید.")
+    
+    def play_message(self, message, score):
+        """پخش پیام یافت شده"""
+        try:
+            self.status_label.config(
+                text=f"▶️ پخش پیام {message['id']} (امتیاز تطابق: {score})", 
+                fg='#3498db'
+            )
+            
+            pygame.mixer.music.load(message['file'])
+            pygame.mixer.music.play()
+            
+            # هایلایت در لیست
+            self.listbox.selection_clear(0, tk.END)
+            # پیدا کردن ایندکس (چون معکوس درج کردیم)
+            idx = len(self.messages) - message['id']
+            self.listbox.selection_set(idx)
+            self.listbox.see(idx)
+            
+        except Exception as e:
+            self.status_label.config(text=f"❌ خطا در پخش: {str(e)}")
+
+# اجرای برنامه
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SmartVoiceReminder(root)
+    root.mainloop()
+
+این برنامه چکاری انجام میدهد 
